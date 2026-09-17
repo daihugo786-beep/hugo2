@@ -70,44 +70,55 @@ module.exports = async (req, res) => {
   }
 
   const model = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
+  const fallbackModel = process.env.GEMINI_MODEL_FALLBACK || 'gemini-2.5-flash-lite';
   const system = json
     ? '你是一個資料查詢規劃器，只能依照給定的schema回傳結構化資料。'
-    : '請用繁體中文，語氣自然口語，簡潔回答（3到4句），不要使用markdown格式（不要用*號、#號等）。';
+    : '請用繁體中文，語氣自然口語，簡潔回答（3到4句）。直接輸出這段摘要的內容本身，不要加任何標題、前綴、編號、「Sentence」字樣、引用標記或markdown格式（不要用*號、#號等），第一個字就要是摘要正文。';
 
   const generationConfig = json
-    ? { responseMimeType: 'application/json', responseSchema: QUERY_SPEC_SCHEMA, maxOutputTokens: 800 }
-    : { maxOutputTokens: 500 };
+    ? { responseMimeType: 'application/json', responseSchema: QUERY_SPEC_SCHEMA, maxOutputTokens: 800, thinkingConfig: { thinkingBudget: 0 } }
+    : { maxOutputTokens: 600, thinkingConfig: { thinkingBudget: 0 } };
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
   const requestBody = JSON.stringify({
     contents: [{ role: 'user', parts: [{ text: prompt }] }],
     systemInstruction: { parts: [{ text: system }] },
     generationConfig,
   });
 
-  try {
+  // Tries one model with a couple of quick retries on 503 (temporary overload).
+  // Returns { apiRes, errText, modelUsed }.
+  async function tryModel(modelName, maxAttempts) {
     let apiRes;
     let errText = '';
-    const maxAttempts = 3;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      apiRes = await fetch(geminiUrl, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: requestBody,
-      });
+      apiRes = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`,
+        { method: 'POST', headers: { 'content-type': 'application/json' }, body: requestBody }
+      );
       if (apiRes.ok) break;
-      // 503 = model temporarily overloaded on Google's side — worth a quick retry.
-      // Anything else (404 bad model, 429 quota, 400 bad request) won't fix itself by retrying.
       if (apiRes.status !== 503 || attempt === maxAttempts) {
         errText = await apiRes.text();
         break;
       }
       await sleep(attempt * 800); // 800ms, then 1600ms
     }
+    return { apiRes, errText, modelUsed: modelName };
+  }
+
+  try {
+    let { apiRes, errText, modelUsed } = await tryModel(model, 3);
+
+    // Primary model still overloaded after retries — try a different model
+    // once before giving up, since a 503 is specific to that one model being busy.
+    if (!apiRes.ok && apiRes.status === 503 && fallbackModel && fallbackModel !== model) {
+      console.error(`${model} still overloaded after retries, trying fallback ${fallbackModel}`);
+      ({ apiRes, errText, modelUsed } = await tryModel(fallbackModel, 2));
+    }
 
     if (!apiRes.ok) {
-      console.error('Gemini API error', apiRes.status, errText);
+      console.error('Gemini API error', modelUsed, apiRes.status, errText);
+
       const status = apiRes.status === 429 ? 429 : 502;
       let msg = 'AI 服務暫時無法使用，請稍後再試。';
       if (apiRes.status === 429) {
@@ -115,14 +126,25 @@ module.exports = async (req, res) => {
       } else if (apiRes.status === 404) {
         msg = '目前設定的模型（' + model + '）可能已被 Google 下架，請到 aistudio.google.com 查目前可用的模型名稱，更新 Vercel 的 GEMINI_MODEL 環境變數。';
       } else if (apiRes.status === 503) {
-        msg = 'Gemini 這個模型現在使用量太大、暫時滿載中（已經自動重試過幾次了），過一下下再問一次通常就會恢復。';
+        msg = 'Gemini 現在使用量太大、暫時滿載中（已經自動重試並換過備用模型），過一下下再問一次通常就會恢復。';
       }
       res.status(status).json({ error: msg, detail: apiRes.status === 429 ? undefined : errText.slice(0, 500) });
       return;
     }
 
     const data = await apiRes.json();
-    const text = data.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || '';
+    let text = data.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || '';
+
+    if (!json) {
+      // Safety net: strip any leaked internal formatting scaffolding
+      // (e.g. "Sentence 2 (Data details):", "**Summary:**") some models
+      // occasionally prepend before the actual answer text.
+      text = text
+        .replace(/^\s*(\*\*?)?Sentence\s*\d+[^:\n]*:\s*\**\s*/gim, '')
+        .replace(/^\s*(\*\*?)?(Summary|Data details|摘要)\s*[:：]\s*\**\s*/gim, '')
+        .replace(/^[\s*#>-]+/, '')
+        .trim();
+    }
 
     if (!text) {
       res.status(502).json({ error: 'AI 沒有回傳內容，請換個問法再試一次。' });
