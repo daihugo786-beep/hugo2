@@ -69,7 +69,7 @@ module.exports = async (req, res) => {
     return;
   }
 
-  const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite';
+  const model = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
   const system = json
     ? '你是一個資料查詢規劃器，只能依照給定的schema回傳結構化資料。'
     : '請用繁體中文，語氣自然口語，簡潔回答（3到4句），不要使用markdown格式（不要用*號、#號等）。';
@@ -78,22 +78,35 @@ module.exports = async (req, res) => {
     ? { responseMimeType: 'application/json', responseSchema: QUERY_SPEC_SCHEMA, maxOutputTokens: 800 }
     : { maxOutputTokens: 500 };
 
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+  const requestBody = JSON.stringify({
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+    systemInstruction: { parts: [{ text: system }] },
+    generationConfig,
+  });
+
   try {
-    const apiRes = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-      {
+    let apiRes;
+    let errText = '';
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      apiRes = await fetch(geminiUrl, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ role: 'user', parts: [{ text: prompt }] }],
-          systemInstruction: { parts: [{ text: system }] },
-          generationConfig,
-        }),
+        body: requestBody,
+      });
+      if (apiRes.ok) break;
+      // 503 = model temporarily overloaded on Google's side — worth a quick retry.
+      // Anything else (404 bad model, 429 quota, 400 bad request) won't fix itself by retrying.
+      if (apiRes.status !== 503 || attempt === maxAttempts) {
+        errText = await apiRes.text();
+        break;
       }
-    );
+      await sleep(attempt * 800); // 800ms, then 1600ms
+    }
 
     if (!apiRes.ok) {
-      const errText = await apiRes.text();
       console.error('Gemini API error', apiRes.status, errText);
       const status = apiRes.status === 429 ? 429 : 502;
       let msg = 'AI 服務暫時無法使用，請稍後再試。';
@@ -101,6 +114,8 @@ module.exports = async (req, res) => {
         msg = '免費額度暫時用完了，請稍後再試（通常隔幾分鐘或隔天就會恢復）。';
       } else if (apiRes.status === 404) {
         msg = '目前設定的模型（' + model + '）可能已被 Google 下架，請到 aistudio.google.com 查目前可用的模型名稱，更新 Vercel 的 GEMINI_MODEL 環境變數。';
+      } else if (apiRes.status === 503) {
+        msg = 'Gemini 這個模型現在使用量太大、暫時滿載中（已經自動重試過幾次了），過一下下再問一次通常就會恢復。';
       }
       res.status(status).json({ error: msg, detail: apiRes.status === 429 ? undefined : errText.slice(0, 500) });
       return;
