@@ -69,7 +69,7 @@ module.exports = async (req, res) => {
     return;
   }
 
-  const model = process.env.GEMINI_MODEL || 'gemini-2.0-flash-lite';
+  const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite';
   const system = json
     ? '你是一個資料查詢規劃器，只能依照給定的schema回傳結構化資料。'
     : '請用繁體中文，語氣自然口語，簡潔回答（3到4句），不要使用markdown格式（不要用*號、#號等）。';
@@ -96,10 +96,12 @@ module.exports = async (req, res) => {
       const errText = await apiRes.text();
       console.error('Gemini API error', apiRes.status, errText);
       const status = apiRes.status === 429 ? 429 : 502;
-      const msg =
-        apiRes.status === 429
-          ? '免費額度暫時用完了，請稍後再試（通常隔幾分鐘或隔天就會恢復）。'
-          : 'AI 服務暫時無法使用，請稍後再試。';
+      let msg = 'AI 服務暫時無法使用，請稍後再試。';
+      if (apiRes.status === 429) {
+        msg = '免費額度暫時用完了，請稍後再試（通常隔幾分鐘或隔天就會恢復）。';
+      } else if (apiRes.status === 404) {
+        msg = '目前設定的模型（' + model + '）可能已被 Google 下架，請到 aistudio.google.com 查目前可用的模型名稱，更新 Vercel 的 GEMINI_MODEL 環境變數。';
+      }
       res.status(status).json({ error: msg, detail: apiRes.status === 429 ? undefined : errText.slice(0, 500) });
       return;
     }
