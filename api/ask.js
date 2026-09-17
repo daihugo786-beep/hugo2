@@ -100,7 +100,7 @@ module.exports = async (req, res) => {
         apiRes.status === 429
           ? '免費額度暫時用完了，請稍後再試（通常隔幾分鐘或隔天就會恢復）。'
           : 'AI 服務暫時無法使用，請稍後再試。';
-      res.status(status).json({ error: msg });
+      res.status(status).json({ error: msg, detail: apiRes.status === 429 ? undefined : errText.slice(0, 500) });
       return;
     }
 
