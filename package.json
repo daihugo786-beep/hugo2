@@ -1,0 +1,6 @@
+{
+  "name": "county-mayor-satisfaction-ai",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AI chat interface over Taiwan county-mayor satisfaction poll data (2003-2026)"
+}
