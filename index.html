@@ -113,7 +113,7 @@ details.notes ul{ margin:0 0 12px; padding-left:18px; color:var(--text-dim); fon
   <div class="wrap">
     <h1>🏛️ 縣市首長施政滿意度 AI 助手</h1>
     <p>資料範圍：2003–2026年・現制22縣市（2010年以前，台中、台南、高雄分別呈現原縣市）｜用一般口語提問，AI 會自動查詢資料並畫成圖表。</p>
-    <p class="quota-notice"><strong>由於使用Google免費提供之API key，故服務次數有限。</strong></p>
+    <p class="quota-notice"><strong>由於使用Google免費提供之API key，服務次數有限；尖峰時段若自行輸入的問題查詢失敗，請稍後再試，或優先點選下方的建議問句（不佔用額度、保證穩定）。</strong></p>
   </div>
 </header>
 
@@ -510,11 +510,17 @@ function drawChart(canvasId, chartData){
 
 function buildTableSummary(q){
   if (q.mode === 'trend'){
+    // Includes the min/max within the selected range (not just first/last),
+    // so the AI has the real extremes to cite instead of inventing a
+    // qualitative range description ("維持在75分以上") that may not hold.
     return q.resultTable.map(r => {
       const pts = r.series.filter(p => p.value != null);
       if (!pts.length) return `${r.county}: 無資料`;
       const first = pts[0], last = pts[pts.length-1];
-      return `${r.county}: ${first.year}年=${first.value} → ${last.year}年=${last.value}`;
+      if (pts.length === 1) return `${r.county}: ${first.year}年=${first.value}`;
+      const maxPt = pts.reduce((a,b) => b.value > a.value ? b : a);
+      const minPt = pts.reduce((a,b) => b.value < a.value ? b : a);
+      return `${r.county}: ${first.year}年=${first.value} → ${last.year}年=${last.value}；區間內最高=${maxPt.year}年${maxPt.value}分，最低=${minPt.year}年${minPt.value}分`;
     }).join('\n');
   }
   if (q.mode === 'ranking'){
@@ -656,7 +662,7 @@ ${tableSummary}
 
 ${q.caveats.length ? '另外，系統偵測到以下資料口徑注意事項，如果跟這個問題相關，請在摘要最後自然帶一句提醒（不用逐條念）：\n' + q.caveats.join('\n') : ''}
 
-不要捏造任何未列出的數字，不要輸出JSON，只要輸出摘要文字本身。`;
+不要捏造任何未列出的數字，不要輸出JSON，只要輸出摘要文字本身。提到任何區間高低的說法時（例如「維持在OO分以上」「都在OO分以下」），只能引用上面明確列出的「最高」「最低」數字，不可以自己歸納出一個上面沒有寫出來的門檻或範圍。`;
 
     let commentaryText = '';
     try {
