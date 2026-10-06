@@ -70,14 +70,21 @@ module.exports = async (req, res) => {
   }
 
   const model = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
-  const fallbackModel = process.env.GEMINI_MODEL_FALLBACK || 'gemini-2.5-flash-lite';
+  const fallbackModel = process.env.GEMINI_MODEL_FALLBACK || 'gemini-3.5-flash-lite';
   const system = json
     ? '你是一個資料查詢規劃器，只能依照給定的schema回傳結構化資料。'
     : '請用繁體中文，語氣自然口語，簡潔回答（3到4句）。直接輸出這段摘要的內容本身，不要加任何標題、前綴、編號、「Sentence」字樣、引用標記或markdown格式（不要用*號、#號等），第一個字就要是摘要正文。';
 
+  // NOTE: previously this sent thinkingConfig: { thinkingBudget: 0 } to try to
+  // disable "thinking" mode. That field is from the Gemini 2.x API shape; the
+  // Gemini 3 model family (gemini-3.6-flash etc.) uses a different field
+  // (thinkingLevel) and rejects thinkingBudget with a 400 "invalid argument" —
+  // which made every real (non-cached) query fail. Dropped entirely rather than
+  // guessing the Gemini-3 field name/values, since the regex sanitizer below
+  // already strips any leaked formatting scaffolding as a safety net.
   const generationConfig = json
-    ? { responseMimeType: 'application/json', responseSchema: QUERY_SPEC_SCHEMA, maxOutputTokens: 800, thinkingConfig: { thinkingBudget: 0 } }
-    : { maxOutputTokens: 600, thinkingConfig: { thinkingBudget: 0 } };
+    ? { responseMimeType: 'application/json', responseSchema: QUERY_SPEC_SCHEMA, maxOutputTokens: 800 }
+    : { maxOutputTokens: 600 };
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const requestBody = JSON.stringify({
@@ -109,11 +116,16 @@ module.exports = async (req, res) => {
   try {
     let { apiRes, errText, modelUsed } = await tryModel(model, 3);
 
-    // Primary model still overloaded after retries — try a different model
-    // once before giving up, since a 503 is specific to that one model being busy.
-    if (!apiRes.ok && apiRes.status === 503 && fallbackModel && fallbackModel !== model) {
-      console.error(`${model} still overloaded after retries, trying fallback ${fallbackModel}`);
-      ({ apiRes, errText, modelUsed } = await tryModel(fallbackModel, 2));
+    // Primary model failed for any reason other than quota exhaustion (429) —
+    // try a different model once before giving up. This covers temporary
+    // overload (503), a retired model name (404), and a bad-request error
+    // (400) that's specific to how the primary model's API expects to be
+    // called (exactly what happened with thinkingConfig above) — a fallback
+    // model may simply not have that problem. 429 is excluded because quota
+    // exhaustion isn't model-specific in the way that matters here.
+    if (!apiRes.ok && apiRes.status !== 429 && fallbackModel && fallbackModel !== model) {
+      console.error(`${model} failed (${apiRes.status}), trying fallback ${fallbackModel}`);
+      ({ apiRes, errText, modelUsed } = await tryModel(fallbackModel, apiRes.status === 503 ? 2 : 1));
     }
 
     if (!apiRes.ok) {
@@ -124,9 +136,15 @@ module.exports = async (req, res) => {
       if (apiRes.status === 429) {
         msg = '免費額度暫時用完了，請稍後再試（通常隔幾分鐘或隔天就會恢復）。';
       } else if (apiRes.status === 404) {
-        msg = '目前設定的模型（' + model + '）可能已被 Google 下架，請到 aistudio.google.com 查目前可用的模型名稱，更新 Vercel 的 GEMINI_MODEL 環境變數。';
+        // Use modelUsed (the model that actually produced this failing response),
+        // not the primary `model` — when the FALLBACK model is the one that's
+        // retired, blaming the primary model here would be actively misleading.
+        const envVarName = modelUsed === fallbackModel ? 'GEMINI_MODEL_FALLBACK' : 'GEMINI_MODEL';
+        msg = `目前設定的模型（${modelUsed}）可能已被 Google 下架，請到 aistudio.google.com 查目前可用的模型名稱，更新 Vercel 的 ${envVarName} 環境變數。`;
       } else if (apiRes.status === 503) {
         msg = 'Gemini 現在使用量太大、暫時滿載中（已經自動重試並換過備用模型），過一下下再問一次通常就會恢復。';
+      } else if (apiRes.status === 400) {
+        msg = `呼叫模型（${modelUsed}）時參數有誤，可能是這個模型版本不接受目前送出的設定，請展開技術細節確認、或到 aistudio.google.com 查這個模型目前接受的參數。`;
       }
       res.status(status).json({ error: msg, detail: apiRes.status === 429 ? undefined : errText.slice(0, 500) });
       return;
